@@ -11,6 +11,16 @@ done
 script_dir="$(cd -- "$(dirname -- "$script_path")" && pwd)"
 cd "$script_dir"
 
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker not found. Install and start Docker Desktop before running this script." >&2
+    exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+    echo "Docker is not running or is inaccessible. Start Docker Desktop and try again." >&2
+    exit 1
+fi
+
 if command -v xhost >/dev/null 2>&1; then
     xhost +localhost
 elif [[ -x /opt/X11/bin/xhost ]]; then
@@ -21,4 +31,4 @@ else
 fi
 
 docker compose build
-docker compose run --rm --entrypoint="" jviewer /usr/local/bin/jviewer-starter.py "$@"
+docker compose run --rm jviewer "$@"

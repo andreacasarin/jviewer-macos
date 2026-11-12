@@ -3,3 +3,7 @@
 *.jar
 *.class
 __pycache__
+.DS_Store
+.venv
+.env
+.env.*

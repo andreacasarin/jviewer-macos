@@ -24,7 +24,7 @@ class MacCompatibilityTests(unittest.TestCase):
         if 'version "1.8.' not in version.stderr:
             raise unittest.SkipTest('Integration test requires Java 8')
 
-    def make_fixture(self, folder, supported=True):
+    def make_fixture(self, folder, supported=True, invalid_calls=False):
         sources = {
             'com/ami/iusb/FloppyRedir.java': '''package com.ami.iusb;
               public class FloppyRedir { public native byte ReadKeybdLEDStatus(); }''',
@@ -50,6 +50,14 @@ class MacCompatibilityTests(unittest.TestCase):
         if not supported:
             sources['com/ami/kvm/jviewer/gui/JViewerApp.java'] = sources[
                 'com/ami/kvm/jviewer/gui/JViewerApp.java'].replace('m_softKeyboard', 'changedKeyboard')
+        if invalid_calls:
+            source = sources['com/ami/kvm/jviewer/gui/JViewerApp.java']
+            source = source.replace('status = new FloppyRedir().ReadKeybdLEDStatus(); }',
+                                    'status = new FloppyRedir().ReadKeybdLEDStatus(); '
+                                    'status = new FloppyRedir().ReadKeybdLEDStatus(); }', 1)
+            source = source.replace('public void syncLED() { status = new FloppyRedir().ReadKeybdLEDStatus(); }',
+                                    'public void syncLED() {}')
+            sources['com/ami/kvm/jviewer/gui/JViewerApp.java'] = source
         paths = []
         for filename, source in sources.items():
             path = Path(folder) / filename
@@ -66,6 +74,9 @@ class MacCompatibilityTests(unittest.TestCase):
             jar.writestr('untouched.txt', 'unchanged resource')
             jar.writestr('META-INF/EXAMPLE.SF', 'old signature')
             jar.writestr('META-INF/EXAMPLE.RSA', 'old signature')
+            jar.writestr('META-INF/EXAMPLE.EC', 'old signature')
+            jar.writestr('META-INF/example.sf', 'old signature')
+            jar.writestr('META-INF/SIG-EXAMPLE', 'old signature')
         return original
 
     def test_real_java_listener_regression_and_cache_invalidation(self):
@@ -101,6 +112,23 @@ class MacCompatibilityTests(unittest.TestCase):
                 self.assertEqual(changed, ['com/ami/kvm/jviewer/gui/JViewerApp.class'])
                 self.assertNotIn('META-INF/EXAMPLE.SF', target.namelist())
                 self.assertNotIn('META-INF/EXAMPLE.RSA', target.namelist())
+                self.assertNotIn('META-INF/EXAMPLE.EC', target.namelist())
+                self.assertNotIn('META-INF/example.sf', target.namelist())
+                self.assertNotIn('META-INF/SIG-EXAMPLE', target.namelist())
+
+    def test_native_calls_must_match_each_callback(self):
+        if os.name == 'nt':
+            self.skipTest('Mac compatibility build is exercised on Linux and macOS')
+        with tempfile.TemporaryDirectory() as folder:
+            original = self.make_fixture(folder, invalid_calls=True)
+            before = original.read_bytes()
+            configuration = config(path=folder, jars=[str(original)], native_libraries=False, java=self.java)
+            with patch.object(starter.platform, 'system', return_value='Darwin'), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(subprocess.CalledProcessError):
+                starter.get_viewer_classpath(configuration)
+            self.assertEqual(original.read_bytes(), before)
+            self.assertEqual(list(Path(folder).glob('JViewer-mac-*.jar')), [])
 
     def test_unknown_firmware_fails_without_modifying_original(self):
         if os.name == 'nt':

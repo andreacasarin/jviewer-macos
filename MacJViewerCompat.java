@@ -1,4 +1,5 @@
 import java.io.*;
+import java.util.Locale;
 import java.util.jar.*;
 import jdk.internal.org.objectweb.asm.*;
 
@@ -7,7 +8,7 @@ public final class MacJViewerCompat implements Opcodes {
     private static byte[] patch(byte[] original) {
         ClassReader reader = new ClassReader(original);
         final int[] fields = {0};
-        final int[] nativeCalls = {0};
+        final int[] methods = {0};
         reader.accept(new ClassVisitor(ASM5) {
             public FieldVisitor visitField(int access, String name, String desc,
                                            String signature, Object value) {
@@ -21,19 +22,26 @@ public final class MacJViewerCompat implements Opcodes {
                                              String signature, String[] exceptions) {
                 if (!(name.equals("onKeybdLED") && desc.equals("(B)V")) &&
                     !(name.equals("syncLED") && desc.equals("()V"))) return null;
+                if ((access & (ACC_STATIC | ACC_ABSTRACT | ACC_NATIVE)) != 0)
+                    throw new IllegalStateException("Unsupported JViewer keyboard LED method flags");
+                methods[0]++;
                 return new MethodVisitor(ASM5) {
+                    private int nativeCalls;
                     public void visitMethodInsn(int opcode, String owner, String name,
                                                 String desc, boolean isInterface) {
                         if (owner.equals("com/ami/iusb/FloppyRedir") &&
-                            name.equals("ReadKeybdLEDStatus") && desc.equals("()B")) nativeCalls[0]++;
+                            name.equals("ReadKeybdLEDStatus") && desc.equals("()B")) nativeCalls++;
+                    }
+                    public void visitEnd() {
+                        if (nativeCalls != 1)
+                            throw new IllegalStateException("Unsupported JViewer keyboard LED native calls");
                     }
                 };
             }
         }, 0);
-        if (fields[0] != 2 || nativeCalls[0] != 2)
+        if (fields[0] != 2 || methods[0] != 2)
             throw new IllegalStateException("Unsupported JViewer keyboard LED layout; original JAR unchanged");
         final ClassWriter writer = new ClassWriter(0);
-        final int[] replaced = {0};
         reader.accept(new ClassVisitor(ASM5, writer) {
             public MethodVisitor visitMethod(int access, String name, String desc,
                                              String signature, String[] exceptions) {
@@ -41,7 +49,6 @@ public final class MacJViewerCompat implements Opcodes {
                 boolean ledEvent = name.equals("onKeybdLED") && desc.equals("(B)V");
                 boolean ledSync = name.equals("syncLED") && desc.equals("()V");
                 if (!ledEvent && !ledSync) return method;
-                replaced[0]++;
                 method.visitCode();
                 if (ledEvent) {
                     // Keep the remote LED state and soft keyboard display, without JNI.
@@ -62,7 +69,6 @@ public final class MacJViewerCompat implements Opcodes {
                 return null;
             }
         }, 0);
-        if (replaced[0] != 2) throw new IllegalStateException("Unsupported JViewer keyboard LED methods");
         return writer.toByteArray();
     }
 
@@ -75,10 +81,13 @@ public final class MacJViewerCompat implements Opcodes {
             byte[] buffer = new byte[8192];
             while ((entry = input.getNextJarEntry()) != null) {
                 String name = entry.getName();
+                String upperName = name.toUpperCase(Locale.ROOT);
                 // The compatibility copy cannot retain the vendor's signatures.
-                if (name.startsWith("META-INF/") &&
-                    (name.endsWith(".SF") || name.endsWith(".RSA") || name.endsWith(".DSA") ||
-                     name.equals("META-INF/MANIFEST.MF"))) continue;
+                if (upperName.startsWith("META-INF/") &&
+                    (upperName.endsWith(".SF") || upperName.endsWith(".RSA") ||
+                     upperName.endsWith(".DSA") || upperName.endsWith(".EC") ||
+                     upperName.startsWith("META-INF/SIG-") ||
+                     upperName.equals("META-INF/MANIFEST.MF"))) continue;
                 ByteArrayOutputStream bytes = new ByteArrayOutputStream();
                 int count;
                 while ((count = input.read(buffer)) != -1) bytes.write(buffer, 0, count);

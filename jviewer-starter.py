@@ -26,24 +26,43 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from urllib.request import Request, HTTPSHandler, build_opener
-from urllib.parse import urlencode, urlsplit, urlunsplit, urljoin
-from urllib.error import HTTPError, URLError
+import argparse
+import getpass
+import hashlib
 from http.client import IncompleteRead
-import argparse, sys, os, re, subprocess, platform, getpass, zipfile, ssl
-import tempfile, shutil, hashlib, shlex, math
+import math
+import os
+import platform
+import re
+import shlex
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
+from urllib.request import HTTPSHandler, Request, build_opener
 import xml.etree.ElementTree as ET
+import zipfile
 
-mainClass = "com.ami.kvm.jviewer.JViewer"
+MAIN_CLASS = 'com.ami.kvm.jviewer.JViewer'
 
 
-def find_property(settings, property):
-    match = re.search(r"^\s*%s\s*=([^\r\n]*)" % re.escape(property), settings, re.MULTILINE)
+def find_property(settings, name):
+    match = re.search(r"^\s*%s\s*=([^\r\n]*)" % re.escape(name), settings, re.MULTILINE)
     return match.group(1).strip() if match else ""
 
 
 def find_java():
     home = os.getenv('JVIEWER_JAVA_HOME')
+    if not home and platform.system() == 'Darwin':
+        result = subprocess.run(
+            ['/usr/libexec/java_home', '--failfast', '--version', '1.8', '--arch', 'x86_64'],
+            capture_output=True, text=True, timeout=15)
+        if result.returncode == 0:
+            home = result.stdout.strip()
     executable = 'java.exe' if platform.system() == 'Windows' else 'java'
     java = os.path.join(home, 'bin', executable) if home else shutil.which(executable)
     if not java:
@@ -59,6 +78,13 @@ def find_java():
     if not version.startswith('1.8.') or arch not in ('x86', 'i386', 'i686', 'amd64', 'x86_64'):
         raise RuntimeError('Unsupported Java: version=%s arch=%s. Use an x86 Java 8 JDK.' % (version, arch))
     return java, 64 if arch in ('amd64', 'x86_64') else 32
+
+
+def find_javac(java):
+    javac = os.path.join(os.path.dirname(java), 'javac')
+    if not os.path.isfile(javac):
+        raise RuntimeError('The macOS workaround needs a Java 8 JDK with javac next to java. Set JVIEWER_JAVA_HOME to that JDK.')
+    return javac
 
 
 def normalize_server(server):
@@ -85,9 +111,14 @@ def parse_configuration(argparser):
     args = argparser.parse_args()
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         argparser.error('--timeout must be greater than zero')
-    args.server = normalize_server(args.host or input('IPMI host: '))
     args.java, args.bits = find_java()
-    print('Using java: %s' % args.java)
+    print('Using %s-bit Java 8: %s' % (args.bits, args.java))
+    if args.check:
+        if platform.system() == 'Darwin':
+            find_javac(args.java)
+        print('Local requirements are ready. Run again with --host to connect.')
+        return args
+    args.server = normalize_server(args.host or input('IPMI host: '))
     args.username = args.username or input('Username: ')
     args.password = args.password if args.password is not None else getpass.getpass()
     context = ssl.create_default_context(cafile=args.ca_cert)
@@ -264,9 +295,7 @@ def get_viewer_classpath(configuration):
         except zipfile.BadZipFile:
             pass
     if not valid:
-        javac = os.path.join(os.path.dirname(configuration.java), 'javac')
-        if not os.path.isfile(javac):
-            raise RuntimeError('The macOS workaround needs a Java 8 JDK with javac next to java. Set JVIEWER_JAVA_HOME to that JDK.')
+        javac = find_javac(configuration.java)
         print('Preparing macOS keyboard LED compatibility workaround')
         with tempfile.TemporaryDirectory(dir=configuration.path) as build:
             subprocess.run([javac, '-XDignore.symbol.file', '-d', build, source], check=True, timeout=60)
@@ -278,16 +307,60 @@ def get_viewer_classpath(configuration):
     return os.pathsep.join(patched if path == original else path for path in jars)
 
 
+def parse_port(value):
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise ValueError('port must be between 1 and 65535')
+    return port
+
+
+def video_endpoint(arguments, override=None):
+    if not arguments or not all(arguments):
+        raise RuntimeError('JNLP is missing required JViewer connection arguments.')
+    if arguments[0].startswith('-'):
+        # AMI firmware uses either named options or the older positional layout.
+        if len(arguments) % 2:
+            raise RuntimeError('JNLP has incomplete named JViewer connection arguments.')
+        options = arguments[::2]
+        if len(set(options)) != len(options) or not all(option.startswith('-') for option in options):
+            raise RuntimeError('JNLP has invalid named JViewer connection arguments.')
+        if '-hostname' not in options or '-kvmport' not in options:
+            raise RuntimeError('JNLP is missing -hostname or -kvmport.')
+        host_index = options.index('-hostname') * 2 + 1
+        port_index = options.index('-kvmport') * 2 + 1
+    else:
+        if len(arguments) < 12:
+            raise RuntimeError('JNLP is missing required JViewer connection arguments.')
+        host_index, port_index = 0, 1
+    try:
+        port = parse_port(arguments[port_index])
+    except ValueError as error:
+        raise RuntimeError('JNLP has an invalid video port.') from error
+    if override is not None:
+        port = override
+        arguments[port_index] = str(port)
+    return arguments[host_index], port
+
+
 def run_jviewer(configuration):
     root = fetch_jnlp(configuration)
     application = root.find('application-desc')
     if application is None:
         raise RuntimeError('JNLP is missing application-desc.')
     arguments = [(entry.text or '').strip() for entry in application.findall('argument')]
-    if len(arguments) < 12 or not all(arguments):
-        raise RuntimeError('JNLP is missing required JViewer connection arguments.')
+    host, port = video_endpoint(arguments, configuration.video_port)
+    print('Checking JViewer video connection to %s:%s' % (host, port))
+    try:
+        with socket.create_connection((host, port), timeout=configuration.timeout):
+            pass
+    except OSError as error:
+        raise RuntimeError(
+            'Cannot reach JViewer video at %s:%s: %s. '
+            'Check the BMC KVM service and firewall. If its configured video port differs, '
+            'use --video-port PORT. HTTPS access does not establish KVM connectivity.' %
+            (host, port, error)) from error
     update_jars(configuration, root)
-    viewer = application.get('main-class', mainClass)
+    viewer = application.get('main-class', MAIN_CLASS)
     args = [configuration.java] + get_java_options(configuration.path)
     args += ['-cp', get_viewer_classpath(configuration), viewer] + arguments
     print('Starting JViewer for ' + configuration.server)
@@ -295,8 +368,10 @@ def run_jviewer(configuration):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description='Download and open the JViewer remote console',
-        epilog='Requires x86 Java 8. The macOS workaround requires a JDK. Set JVIEWER_JAVA_HOME to select it.')
+    parser = argparse.ArgumentParser(description='JViewer for macOS: open an AMI IPMI console without Java Web Start.',
+        epilog='Requires x86 Java 8 (a JDK on macOS). macOS discovers installed x64 Java 8 automatically. '
+               'Set JVIEWER_JAVA_HOME to override, or run --check to verify local requirements.')
+    parser.add_argument('--check', action='store_true', help='check the local Java setup without connecting or asking for credentials')
     parser.add_argument('--host', help='hostname, IP address, or HTTP(S) origin of the IPMI server')
     parser.add_argument('--username', help='IPMI username')
     parser.add_argument('--password', help='IPMI password (omit for a hidden prompt)')
@@ -304,6 +379,7 @@ def build_parser():
     tls.add_argument('--insecure', action='store_true', help='disable HTTPS certificate verification for a trusted IPMI server')
     tls.add_argument('--ca-cert', help='PEM CA certificate used to verify HTTPS')
     parser.add_argument('--refresh', action='store_true', help='download and validate current firmware JARs again')
+    parser.add_argument('--video-port', type=parse_port, help='override the video TCP port advertised by the BMC (1-65535)')
     parser.add_argument('--timeout', type=float, default=15, help='network timeout in seconds (default: 15)')
     return parser
 
@@ -312,6 +388,8 @@ def main():
     parser = build_parser()
     try:
         configuration = parse_configuration(parser)
+        if configuration.check:
+            return 0
         return run_jviewer(configuration)
     except HTTPError as error:
         print('Error: HTTP %s while requesting %s. Check the firmware resource or login endpoint.' %

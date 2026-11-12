@@ -1,10 +1,8 @@
 services:
   jviewer:
-    container_name: jviewer
     build: .
     platform: linux/amd64
     init: true
-    restart: "no"
     volumes:
       - jviewer-cache:/root/.local/share/jviewer-starter
     environment:

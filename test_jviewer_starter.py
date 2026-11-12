@@ -42,13 +42,47 @@ def descriptor():
 
 
 def config(**kwargs):
-    values = dict(server='https://ipmi', bits=64, timeout=5, refresh=False,
+    values = dict(server='https://ipmi', bits=64, timeout=5, refresh=False, video_port=None,
                   username='root', password='PRIVATE_PASSWORD', java='/jdk/bin/java', opener=Mock())
     values.update(kwargs)
     return SimpleNamespace(**values)
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_macos_discovers_x64_java8_instead_of_default_java(self):
+        home = '/Library/Java/JavaVirtualMachines/x64 Java 8/Contents/Home'
+        with patch.dict(os.environ, {'JVIEWER_JAVA_HOME': ''}), \
+             patch.object(starter.platform, 'system', return_value='Darwin'), \
+             patch.object(starter.subprocess, 'run', side_effect=[
+                 SimpleNamespace(returncode=0, stdout=home + '\n'),
+                 SimpleNamespace(stdout=b'java.version = 1.8.0_482\nos.arch = x86_64')]) as run:
+            self.assertEqual(starter.find_java(), (os.path.join(home, 'bin', 'java'), 64))
+        self.assertEqual(run.call_args_list[0].args[0],
+                         ['/usr/libexec/java_home', '--failfast', '--version', '1.8', '--arch', 'x86_64'])
+        self.assertEqual(run.call_args_list[1].args[0][0], os.path.join(home, 'bin', 'java'))
+
+    def test_macos_uses_path_when_no_registered_java8_exists(self):
+        with patch.dict(os.environ, {'JVIEWER_JAVA_HOME': ''}), \
+             patch.object(starter.platform, 'system', return_value='Darwin'), \
+             patch.object(starter.shutil, 'which', return_value='/custom/bin/java'), \
+             patch.object(starter.subprocess, 'run', side_effect=[
+                 SimpleNamespace(returncode=1, stdout=''),
+                 SimpleNamespace(stdout=b'java.version = 1.8.0_482\nos.arch = amd64')]):
+            self.assertEqual(starter.find_java(), ('/custom/bin/java', 64))
+
+    def test_check_does_not_prompt_or_connect(self):
+        with patch.object(starter.sys, 'argv', ['starter', '--check']), \
+             patch.object(starter, 'find_java', return_value=('/jdk/bin/java', 64)), \
+             patch.object(starter.platform, 'system', return_value='Darwin'), \
+             patch.object(starter, 'find_javac', return_value='/jdk/bin/javac') as compiler, \
+             patch('builtins.input') as prompt, patch.object(starter.getpass, 'getpass') as password, \
+             patch.object(starter, 'build_opener') as network, \
+             patch.object(starter, 'run_jviewer') as viewer, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(starter.main(), 0)
+        compiler.assert_called_once_with('/jdk/bin/java')
+        for unused in (prompt, password, network, viewer):
+            unused.assert_not_called()
+
     def test_hosts(self):
         for host, expected in [('192.0.2.225', 'http://192.0.2.225'),
                                (' HTTPS://IPMI:443/ ', 'https://ipmi'),
@@ -116,8 +150,47 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(starter.get_java_options('/cache'),
                              ['-Djava.library.path=/cache', '-Dexample=value with spaces', '-Xmx512m'])
 
+    def test_invalid_video_ports(self):
+        for port in ('0', '-1', '65536', 'abc'):
+            with self.subTest(port=port), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                starter.build_parser().parse_args(['--video-port', port])
+
 
 class ProtocolTests(unittest.TestCase):
+    def test_named_jnlp_arguments_launch_with_video_port_override(self):
+        root = descriptor()
+        application = root.find('application-desc')
+        application.clear()
+        arguments = ['-apptype', 'JViewer', '-hostname', 'ipmi', '-kvmtoken', 'PRIVATE_TOKEN',
+                     '-kvmport', '7578', '-webcookie', 'PRIVATE_SESSION']
+        for argument in arguments:
+            ET.SubElement(application, 'argument').text = argument
+        stdout = io.StringIO()
+        with patch.object(starter, 'fetch_jnlp', return_value=root), \
+             patch.object(starter.socket, 'create_connection') as connect, \
+             patch.object(starter, 'update_jars'), \
+             patch.object(starter, 'get_viewer_classpath', return_value='/cache/JViewer.jar'), \
+             patch.object(starter.subprocess, 'call', return_value=0) as run, \
+             contextlib.redirect_stdout(stdout):
+            starter.run_jviewer(config(path='/cache', video_port=5900))
+        connect.assert_called_once_with(('ipmi', 5900), timeout=5)
+        arguments[7] = '5900'
+        self.assertEqual(run.call_args.args[0][-len(arguments):], arguments)
+        self.assertNotIn('PRIVATE_', stdout.getvalue())
+
+    def test_named_jnlp_uses_advertised_video_port(self):
+        arguments = ['-hostname', 'ipmi', '-kvmport', '6000']
+        self.assertEqual(starter.video_endpoint(arguments), ('ipmi', 6000))
+
+    def test_invalid_video_arguments_stop_before_connection(self):
+        for arguments in (['-hostname', 'ipmi'], ['-hostname', 'ipmi', '-kvmport'],
+                          ['-hostname', 'ipmi', '-kvmport', 'abc'],
+                          ['-hostname', 'ipmi', '-kvmport', '0'],
+                          ['-hostname', 'ipmi', '-kvmport', '7578', '-kvmport', '5900'],
+                          ['-hostname', 'ipmi', 'kvmport', '7578']):
+            with self.subTest(arguments=arguments), self.assertRaises(RuntimeError):
+                starter.video_endpoint(arguments)
+
     def test_login_and_xml_arguments(self):
         configuration = config(server='https://ipmi:8443')
         configuration.opener.open.side_effect = [response(b"'SESSION_COOKIE' : 'abc123'"),
@@ -176,6 +249,7 @@ class ProtocolTests(unittest.TestCase):
         configuration = config(path='/cache')
         stdout = io.StringIO()
         with patch.object(starter, 'fetch_jnlp', return_value=descriptor()), \
+             patch.object(starter.socket, 'create_connection') as connect, \
              patch.object(starter, 'update_jars'), \
              patch.object(starter, 'get_viewer_classpath', return_value='/cache/JViewer.jar'), \
              patch.object(starter.subprocess, 'call', return_value=7) as run, \
@@ -184,6 +258,43 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn('PRIVATE_TOKEN', run.call_args.args[0])
         self.assertIn('Ctrl & Alt', run.call_args.args[0])
         self.assertNotIn('PRIVATE_', stdout.getvalue())
+        connect.assert_called_once_with(('ipmi', 7578), timeout=5)
+
+    def test_video_port_override_is_checked_and_passed_to_java(self):
+        root = descriptor()
+        root.find('application-desc').findall('argument')[1].text = '6000'
+        with patch.object(starter, 'fetch_jnlp', return_value=root), \
+             patch.object(starter.socket, 'create_connection') as connect, \
+             patch.object(starter, 'update_jars'), \
+             patch.object(starter, 'get_viewer_classpath', return_value='/cache/JViewer.jar'), \
+             patch.object(starter.subprocess, 'call', return_value=0) as run, \
+             contextlib.redirect_stdout(io.StringIO()):
+            starter.run_jviewer(config(path='/cache', video_port=5900))
+        connect.assert_called_once_with(('ipmi', 5900), timeout=5)
+        self.assertEqual(run.call_args.args[0][-12:][:2], ['ipmi', '5900'])
+
+    def test_unreachable_video_stops_before_downloads_and_java(self):
+        for error in (ConnectionRefusedError('refused'), TimeoutError('timed out')):
+            with self.subTest(error=error), \
+                 patch.object(starter, 'fetch_jnlp', return_value=descriptor()), \
+                 patch.object(starter.socket, 'create_connection', side_effect=error), \
+                 patch.object(starter, 'update_jars') as update, \
+                 patch.object(starter.subprocess, 'call') as run, \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 self.assertRaisesRegex(RuntimeError, r'ipmi:7578.*--video-port') as raised:
+                starter.run_jviewer(config())
+            update.assert_not_called()
+            run.assert_not_called()
+            self.assertNotIn('PRIVATE_', str(raised.exception))
+
+    def test_fresh_jnlp_video_port_is_used(self):
+        root = descriptor()
+        root.find('application-desc').findall('argument')[1].text = '6000'
+        with patch.object(starter, 'fetch_jnlp', return_value=root), \
+             patch.object(starter.socket, 'create_connection', side_effect=ConnectionRefusedError) as connect, \
+             contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+            starter.run_jviewer(config())
+        connect.assert_called_once_with(('ipmi', 6000), timeout=5)
 
     def test_invalid_launch_arguments_fail_before_downloads(self):
         with patch.object(starter, 'fetch_jnlp', return_value=ET.fromstring('<jnlp><application-desc/></jnlp>')), \
