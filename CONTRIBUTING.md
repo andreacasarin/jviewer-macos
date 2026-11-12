@@ -39,6 +39,8 @@ JVIEWER_TEST_JAVA_HOME="/path/to/java8-jdk" python3 -W error -B -m unittest disc
 typically ends with `Contents/Home`. These tests compile a synthetic viewer,
 reproduce the missing-native-library failure, verify the patched callbacks with
 Java bytecode verification, and check cache invalidation and rejected layouts.
+Keyboard tests cover empty/unsupported language fallback, preserved manual
+selection, successful auto-detection, and safe handling of unknown keyboard code.
 The compatibility build runs on Linux/macOS; Windows runs the Python tests.
 
 For container changes, also run:

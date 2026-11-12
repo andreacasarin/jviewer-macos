@@ -11,6 +11,8 @@ downloads a `.jnlp` file instead of offering an HTML5 console.
 - Automatic x64 Java 8 selection on macOS, including Apple Silicon with Rosetta.
 - A targeted macOS workaround for the native keyboard LED failure that can leave
   JViewer black at **0 fps**.
+- Automatic fallback to manual keyboard layout selection when JViewer cannot
+  detect the input language, avoiding repeated warnings and slow typing.
 
 This is a maintained fork of [dfuchslin/jviewer-starter](https://github.com/dfuchslin/jviewer-starter),
 originally based on [arbu/jviewer-starter](https://github.com/arbu/jviewer-starter).
@@ -127,7 +129,7 @@ If you know a forwarded or configured video port differs, use
 `--video-port 5900` (example only). Normally omit it to follow the firmware.
 The launcher does not scan for alternative ports.
 
-## macOS black-screen workaround
+## macOS keyboard workarounds
 
 Some firmware supplies Windows/Linux native libraries but none for macOS.
 JViewer can then fail in its native keyboard LED calls, opening a black console
@@ -139,6 +141,14 @@ the soft keyboard. It checks the expected fields, methods, and native calls,
 and refuses unsupported layouts. The original downloaded JAR is unchanged;
 signature metadata is removed from the modified copy. The copy is rebuilt when
 the viewer JAR or helper source changes.
+
+Some versions also report an empty or unsupported input language on macOS,
+printing `Language not supported:` on every key press. For recognized firmware,
+the compatibility copy turns off **Keyboard → Language → Auto Detect** after
+the first unsupported result, keeps the current layout, and prints one hint.
+Choose your layout from that menu if needed. Supported language detection stays
+active. If the keyboard code differs from the recognized layout, the helper
+preserves it and reports that manual selection may be needed.
 
 Local keyboard LED synchronization and physical drive redirection are unavailable
 without native libraries. Other virtual media behavior has not been verified by
@@ -176,6 +186,7 @@ A live XQuartz/KVM session still needs validation on your setup.
 | HTTP 404 for a JAR | The firmware references a missing resource. The launcher cannot supply missing vendor libraries. |
 | Video connection refused / timed out | Check the BMC's KVM service, advertised port, and firewall. Web login alone does not establish KVM access. |
 | Console opens but stays black | Inspect terminal diagnostics. Native-library errors, authentication, host video output, and network access are separate causes. |
+| Slow typing with repeated `Language not supported:` messages | Relaunch after updating this checkout to rebuild the compatibility copy automatically. If needed, open **Keyboard → Language**, turn off **Auto Detect**, and select your keyboard layout. Manual selection stopped the warnings and improved typing on the tested S1200SP; the automatic fallback has offline regression coverage. |
 | Missing compiler / unsupported workaround layout | Use a Java 8 JDK with `javac`. Unknown firmware needs inspection before a compatible patch can be added. |
 | Docker cannot start | Start Docker Desktop; for a GUI, also start XQuartz with network clients enabled. |
 

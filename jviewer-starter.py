@@ -296,7 +296,7 @@ def get_viewer_classpath(configuration):
             pass
     if not valid:
         javac = find_javac(configuration.java)
-        print('Preparing macOS keyboard LED compatibility workaround')
+        print('Preparing macOS keyboard compatibility workarounds')
         with tempfile.TemporaryDirectory(dir=configuration.path) as build:
             subprocess.run([javac, '-XDignore.symbol.file', '-d', build, source], check=True, timeout=60)
             output = os.path.join(build, 'JViewer-mac.jar')

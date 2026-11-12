@@ -24,7 +24,8 @@ class MacCompatibilityTests(unittest.TestCase):
         if 'version "1.8.' not in version.stderr:
             raise unittest.SkipTest('Integration test requires Java 8')
 
-    def make_fixture(self, folder, supported=True, invalid_calls=False):
+    def make_fixture(self, folder, supported=True, invalid_calls=False, keyboard=False,
+                     unknown_keyboard=False, missing_menu=False, missing_guard=False):
         sources = {
             'com/ami/iusb/FloppyRedir.java': '''package com.ami.iusb;
               public class FloppyRedir { public native byte ReadKeybdLEDStatus(); }''',
@@ -58,6 +59,97 @@ class MacCompatibilityTests(unittest.TestCase):
             source = source.replace('public void syncLED() { status = new FloppyRedir().ReadKeybdLEDStatus(); }',
                                     'public void syncLED() {}')
             sources['com/ami/kvm/jviewer/gui/JViewerApp.java'] = source
+        if keyboard:
+            sources['com/ami/kvm/jviewer/gui/JViewerApp.java'] = sources[
+                'com/ami/kvm/jviewer/gui/JViewerApp.java'].replace('private byte status;', '''
+                private static final JViewerApp instance = new JViewerApp();
+                private JVFrame window = new JVFrame();
+                public static JViewerApp getInstance() { return instance; }
+                public JVFrame getMainWindow() { return window; }
+                private byte status;''')
+            sources.update({
+                'com/ami/kvm/jviewer/gui/JVFrame.java': '''package com.ami.kvm.jviewer.gui;
+                  import java.awt.im.InputContext;
+                  import java.util.Locale;
+                  public class JVFrame {
+                    public static Locale locale;
+                    public static int localeQueries;
+                    private JVMenu menu = new JVMenu();
+                    private InputContext context = new InputContext() {
+                      public Locale getLocale() { localeQueries++; return locale; }
+                    };
+                    public InputContext getInputContext() { return context; }
+                    public JVMenu getMenu() { return menu; }
+                  }''',
+                'com/ami/kvm/jviewer/gui/JVMenu.java': '''package com.ami.kvm.jviewer.gui;
+                  import com.ami.kvm.jviewer.kvmpkts.USBKeyProcessor.Layout;
+                  public class JVMenu {
+                    public boolean autoDetect = true;
+                    public void notifyLayoutAutoDetect(boolean enabled) { autoDetect = enabled; }
+                    public void notifyLayout(Layout layout) {}
+                  }''',
+                'com/ami/kvm/jviewer/kvmpkts/USBKeyProcessor.java': '''package com.ami.kvm.jviewer.kvmpkts;
+                  import com.ami.kvm.jviewer.gui.*;
+                  import java.awt.im.InputContext;
+                  public class USBKeyProcessor {
+                    public enum Layout { ENGLISH, ITALIAN, FRENCH }
+                    public Layout currentLayout = Layout.ENGLISH;
+                    public boolean layoutAutoDetect = true;
+                    public void setLayout(Layout layout) { currentLayout = layout; }
+                    public void doLayoutAutoDetect() {
+                      if (!layoutAutoDetect) return;
+                      InputContext input = JViewerApp.getInstance().getMainWindow().getInputContext();
+                      String language = input.getLocale().getLanguage();
+                      Layout detected;
+                      if (language == "en") detected = Layout.ENGLISH;
+                      else if (language == "it") detected = Layout.ITALIAN;
+                      else {
+                        System.err.println("Language not supported: " + language);
+                        detected = Layout.ENGLISH;
+                      }
+                      if (detected != currentLayout) {
+                        setLayout(detected);
+                        JViewerApp.getInstance().getMainWindow().getMenu().notifyLayout(detected);
+                      }
+                    }
+                  }''',
+                'KeyboardCheck.java': '''import com.ami.kvm.jviewer.gui.*;
+                  import com.ami.kvm.jviewer.kvmpkts.USBKeyProcessor;
+                  import com.ami.kvm.jviewer.kvmpkts.USBKeyProcessor.Layout;
+                  import java.util.Locale;
+                  public class KeyboardCheck {
+                    public static void main(String[] args) {
+                      JVFrame.locale = new Locale(args[0]);
+                      USBKeyProcessor keys = new USBKeyProcessor();
+                      keys.setLayout(Layout.FRENCH);
+                      for (int i = 0; i < 100; i++) keys.doLayoutAutoDetect();
+                      boolean supported = args[0].equals("en") || args[0].equals("it");
+                      Layout expected = supported ? (args[0].equals("it") ? Layout.ITALIAN : Layout.ENGLISH)
+                                                  : Layout.FRENCH;
+                      if (keys.currentLayout != expected) throw new AssertionError("Layout changed incorrectly");
+                      if (keys.layoutAutoDetect != supported ||
+                          JViewerApp.getInstance().getMainWindow().getMenu().autoDetect != supported)
+                        throw new AssertionError("Auto Detect menu/state mismatch");
+                      if (JVFrame.localeQueries != (supported ? 100 : 1))
+                        throw new AssertionError("Unexpected repeated language detection");
+                      if (!supported) {
+                        keys.setLayout(Layout.ITALIAN);
+                        keys.doLayoutAutoDetect();
+                        if (keys.currentLayout != Layout.ITALIAN) throw new AssertionError("Manual selection lost");
+                      }
+                      System.out.println("Keyboard layout checks passed");
+                    }
+                  }'''
+            })
+            if unknown_keyboard:
+                name = 'com/ami/kvm/jviewer/kvmpkts/USBKeyProcessor.java'
+                sources[name] = sources[name].replace('System.err.println', 'System.out.println')
+            if missing_menu:
+                name = 'com/ami/kvm/jviewer/gui/JVMenu.java'
+                sources[name] = sources[name].replace('notifyLayoutAutoDetect', 'changedMenuMethod')
+            if missing_guard:
+                name = 'com/ami/kvm/jviewer/kvmpkts/USBKeyProcessor.java'
+                sources[name] = sources[name].replace('if (!layoutAutoDetect) return;', '')
         paths = []
         for filename, source in sources.items():
             path = Path(folder) / filename
@@ -78,6 +170,52 @@ class MacCompatibilityTests(unittest.TestCase):
             jar.writestr('META-INF/example.sf', 'old signature')
             jar.writestr('META-INF/SIG-EXAMPLE', 'old signature')
         return original
+
+    def test_keyboard_detection_falls_back_once_and_preserves_manual_layout(self):
+        if os.name == 'nt':
+            self.skipTest('Mac compatibility build is exercised on Linux and macOS')
+        with tempfile.TemporaryDirectory() as folder:
+            original = self.make_fixture(folder, keyboard=True)
+            before = original.read_bytes()
+            baseline = subprocess.run([self.java, '-cp', str(original), 'KeyboardCheck', ''],
+                                      capture_output=True, text=True)
+            self.assertNotEqual(baseline.returncode, 0)
+            self.assertEqual(baseline.stderr.count('Language not supported:'), 100)
+            configuration = config(path=folder, jars=[str(original)], native_libraries=False, java=self.java)
+            with patch.object(starter.platform, 'system', return_value='Darwin'), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                classpath = starter.get_viewer_classpath(configuration)
+            self.assertEqual(original.read_bytes(), before)
+            for language in ('', 'xx', 'en', 'it'):
+                with self.subTest(language=language):
+                    result = subprocess.run([self.java, '-Xverify:all', '-cp', classpath,
+                                             'KeyboardCheck', language], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('Keyboard layout checks passed', result.stdout)
+                    self.assertNotIn('Language not supported:', result.stderr)
+                    self.assertEqual(result.stderr.count('Keyboard language auto-detection unavailable;'),
+                                     0 if language in ('en', 'it') else 1)
+            with zipfile.ZipFile(original) as source, zipfile.ZipFile(classpath) as target:
+                changed = {name for name in target.namelist() if source.read(name) != target.read(name)}
+                self.assertEqual(changed, {'com/ami/kvm/jviewer/gui/JViewerApp.class',
+                                           'com/ami/kvm/jviewer/kvmpkts/USBKeyProcessor.class'})
+
+    def test_unknown_keyboard_layout_keeps_vendor_class_and_led_workaround(self):
+        if os.name == 'nt':
+            self.skipTest('Mac compatibility build is exercised on Linux and macOS')
+        for options in ({'unknown_keyboard': True}, {'missing_menu': True}, {'missing_guard': True}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as folder:
+                original = self.make_fixture(folder, keyboard=True, **options)
+                configuration = config(path=folder, jars=[str(original)], native_libraries=False, java=self.java)
+                with patch.object(starter.platform, 'system', return_value='Darwin'), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    classpath = starter.get_viewer_classpath(configuration)
+                with zipfile.ZipFile(original) as source, zipfile.ZipFile(classpath) as target:
+                    name = 'com/ami/kvm/jviewer/kvmpkts/USBKeyProcessor.class'
+                    self.assertEqual(source.read(name), target.read(name))
+                result = subprocess.run([self.java, '-Xverify:all', '-cp', classpath,
+                                         'com.ami.kvm.jviewer.gui.JViewerApp'], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_real_java_listener_regression_and_cache_invalidation(self):
         with tempfile.TemporaryDirectory(prefix='jviewer test ') as folder:
